@@ -1,13 +1,11 @@
 #!/system/bin/sh
-
-# 语言选择 / Language Select
 ui_print "============================================="
 ui_print "  请选择语言 / Please Select Language"
 ui_print "  音量上 = 中文  |  Volume UP = Chinese"
 ui_print "  音量下 = 英文  |  Volume DOWN = English"
 ui_print "============================================="
 
-LANG="zh" # 默认中文
+LANG="zh"
 while true; do
   keyevent=$(timeout 0.5 getevent -l 2>/dev/null)
   if echo "$keyevent" | grep -q "KEY_VOLUMEUP"; then
@@ -21,11 +19,10 @@ while true; do
   fi
 done
 
-# 持久化保存语言配置，给WebUI读取
-ksud module config set user_lang $LANG 2>/dev/null
+echo "$LANG" > "$MODPATH/lang.txt"
+ksud module config set user_lang "$LANG" 2>/dev/null
 sleep 1
 
-# 定义多语言文本
 if [ "$LANG" = "zh" ]; then
   T_VERIFY="- 正在验证设备型号"
   T_DEVICE_OK="- 设备验证完成："
@@ -70,7 +67,6 @@ else
   T_DONE_NO="Install complete. Please reboot your system"
 fi
 
-# 主脚本开始
 ui_print "$T_VERIFY"
 _model=$(getprop ro.product.model 2>/dev/null)
 _name=$(getprop ro.product.name 2>/dev/null)
