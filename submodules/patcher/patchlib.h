@@ -506,7 +506,54 @@ static BOOLEAN str_at(const CHAR8* buffer, INT32 size, INT64 file_off, const CHA
     return memcmp_patcher(buffer + file_off, needle, len) == 0;
 }
 
-static INT64 calc_adrl_file_offset(const CHAR8* buffer, INT32 adrp_off, UINT64 load_base) {
+static UINT32 read_u32_unaligned(const CHAR8* buffer, INT32 off) {
+    return (UINT8)buffer[off]
+         | ((UINT8)buffer[off+1] << 8)
+         | ((UINT8)buffer[off+2] << 16)
+         | ((UINT8)buffer[off+3] << 24);
+}
+
+static INT32 detect_pe_image_delta(const CHAR8* buffer, INT32 size) {
+    static const CHAR8* cached_buffer = 0;
+    static INT32 cached_size = 0;
+    static INT32 cached_delta = 0;
+
+    if (cached_buffer == buffer && cached_size == size)
+        return cached_delta;
+
+    cached_buffer = buffer;
+    cached_size = size;
+    cached_delta = 0;
+
+    if (size < 0x44)
+        return 0;
+
+    INT32 limit = size - 0x44;
+    if (limit > 0x1000) limit = 0x1000;
+
+    for (INT32 off = 0; off <= limit; ++off) {
+        if (buffer[off] != 'M' || buffer[off + 1] != 'Z')
+            continue;
+
+        UINT32 pe_rel = read_u32_unaligned(buffer, off + 0x3c);
+        INT64 pe_sig = (INT64)off + (INT64)pe_rel;
+        if (pe_sig < 0 || pe_sig + 4 > size)
+            continue;
+
+        if (buffer[pe_sig] == 'P'
+            && buffer[pe_sig + 1] == 'E'
+            && buffer[pe_sig + 2] == 0
+            && buffer[pe_sig + 3] == 0) {
+            cached_delta = off;
+            return cached_delta;
+        }
+    }
+
+    return 0;
+}
+
+static INT64 calc_adrl_file_offset(const CHAR8* buffer, INT32 size,
+                                   INT32 adrp_off, UINT64 load_base) {
     DecodedInst d0 = decode_at(buffer, adrp_off);
     DecodedInst d1 = decode_at(buffer, adrp_off + 4);
 
@@ -514,10 +561,14 @@ static INT64 calc_adrl_file_offset(const CHAR8* buffer, INT32 adrp_off, UINT64 l
     if (d1.type != INST_ADD_X_IMM) return -1;
     if (d1.rt != d0.rt || d1.rn != d0.rt) return -1;
 
-    UINT64 pc      = load_base + (UINT64)adrp_off;
+    INT32 image_delta = detect_pe_image_delta(buffer, size);
+    INT64 image_off = (INT64)adrp_off - image_delta;
+    if (image_off < 0) return -1;
+
+    UINT64 pc      = load_base + (UINT64)image_off;
     UINT64 page_pc = pc & ~0xFFFull;
     UINT64 target_va = (UINT64)((INT64)page_pc + d0.simm) + d1.imm;
-    return (INT64)(target_va - load_base);
+    return (INT64)(target_va - load_base) + image_delta;
 }
 
 INT32 patch_adrl_unlocked_to_locked(CHAR8* buffer, INT32 size, UINT64 load_base) {
@@ -540,8 +591,8 @@ INT32 patch_adrl_unlocked_to_locked(CHAR8* buffer, INT32 size, UINT64 load_base)
         UINT8 xa = a0.rt, xb = b0.rt;
         if (xa == xb) continue;
 
-        INT64 off0 = calc_adrl_file_offset(buffer, i,      load_base);
-        INT64 off1 = calc_adrl_file_offset(buffer, i + 8,  load_base);
+        INT64 off0 = calc_adrl_file_offset(buffer, size, i,      load_base);
+        INT64 off1 = calc_adrl_file_offset(buffer, size, i + 8,  load_base);
 
         if (!str_at(buffer, size, off0, "unlocked")) continue;
         if (!str_at(buffer, size, off1, "locked"))   continue;
@@ -550,7 +601,7 @@ INT32 patch_adrl_unlocked_to_locked(CHAR8* buffer, INT32 size, UINT64 load_base)
             DecodedInst c0 = decode_at(buffer, j);
             DecodedInst c1 = decode_at(buffer, j + 4);
             if(c0.type == INST_ADRP && c1.type == INST_ADD_X_IMM){
-                INT64 offc = calc_adrl_file_offset(buffer, j, load_base);
+                INT64 offc = calc_adrl_file_offset(buffer, size, j, load_base);
                 if(str_at(buffer, size, offc, "androidboot.vbmeta.device_state")){
                     match = TRUE;
                     break;
@@ -610,7 +661,7 @@ BOOLEAN patch_string_jump(CHAR8* buffer, INT32 size) {
             DecodedInst a1 = decode_at(buffer, jmp + 4);
             if (a0.type != INST_ADRP || a1.type != INST_ADD_X_IMM) continue;
             if (a1.rt != a0.rt || a1.rn != a0.rt) continue;
-            INT64 off0 = calc_adrl_file_offset(buffer, jmp, 0);
+            INT64 off0 = calc_adrl_file_offset(buffer, size, jmp, 0);
             if (off0 < 0 || off0 >= size) continue;
             CHAR8* str = buffer + off0;
             if(check_sub_string(str, keyword)){
@@ -643,8 +694,8 @@ INT32 find_warning_offset(CHAR8* buffer, INT32 size, UINT64 load_base) {
         UINT8 xa = a0.rt, xb = b0.rt;
         if (xa == xb) continue;
 
-        INT64 off0 = calc_adrl_file_offset(buffer, i,      load_base);
-        INT64 off1 = calc_adrl_file_offset(buffer, i + 8,  load_base);
+        INT64 off0 = calc_adrl_file_offset(buffer, size, i,      load_base);
+        INT64 off1 = calc_adrl_file_offset(buffer, size, i + 8,  load_base);
 
         if (!str_at(buffer, size, off0, "Orange State\n")) continue;
         if (!str_at(buffer, size, off1, "Your device has been unlocked and can't be trusted\n"))   continue;
@@ -683,25 +734,26 @@ BOOLEAN patch_warning(CHAR8* buffer, INT32 size, INT32 global_var_offset) {
     return TRUE;
 }
 
-/* Region-bind compatibility bypass.
+/* Stage A — region compatibility bypass.
  *
+ * Stage A-1 handles the direct string/branch layout.
  * Anchor: diagnostic string printed when image / device region tags
  * mismatch (typo "is not invalid" intact in known vintages).
  *
- * Stage A: Rewrite the cbz Xt sitting one instruction before the
+ * A-1 primary: rewrite the cbz Xt sitting one instruction before the
  * adrp+add to that string into an unconditional B with the same
  * compatible-path target. The primary mismatch branch can no longer
  * fall into the shutdown sequence.
  *
- * Stage B: Two secondary shutdown branches (B.EQ and CBNZ Xt) in the
+ * A-1 secondary: two shutdown branches (B.EQ and CBNZ Xt) in the
  * same block remain reachable from alternative entries that bypass
  * the cbz. They both target a single shutdown stub. Overwrite that
  * stub's first instruction with an unconditional B to the same
  * compatible-path target so every incoming branch becomes a no-op
  * redirect.
  *
- * 8-byte runtime patch (4 + 4). Stage A alone is enough for the
- * common direct-mismatch case; Stage B closes the rarer secondary
+ * 8-byte runtime patch (4 + 4). The primary patch is enough for the
+ * common direct-mismatch case; the secondary patch closes rarer
  * paths. No-op on images without the anchor.
  */
 INT32 patch_region_lockout_bypass(CHAR8* buffer, INT32 size) {
@@ -717,10 +769,10 @@ INT32 patch_region_lockout_bypass(CHAR8* buffer, INT32 size) {
         }
     }
     if (str_off < 0) {
-        Print_patcher("region bypass: anchor not found, skipping\n");
+        Print_patcher("region bypass A-1: anchor not found, skipping\n");
         return 0;
     }
-    Print_patcher("region bypass: anchor @ 0x%X\n", str_off);
+    Print_patcher("region bypass A-1: anchor @ 0x%X\n", str_off);
 
     /* Locate the adrp+add pair that materialises the anchor address. */
     INT32 adrl_off = -1;
@@ -730,22 +782,22 @@ INT32 patch_region_lockout_bypass(CHAR8* buffer, INT32 size) {
         DecodedInst d1 = decode_at(buffer, i + 4);
         if (d1.type != INST_ADD_X_IMM) continue;
         if (d1.rt != d0.rt || d1.rn != d0.rt) continue;
-        INT64 t = calc_adrl_file_offset(buffer, i, 0);
+        INT64 t = calc_adrl_file_offset(buffer, size, i, 0);
         if (t == (INT64)str_off) {
             adrl_off = i;
             break;
         }
     }
     if (adrl_off < 0) {
-        Print_patcher("region bypass: adrp+add ref not found, skipping\n");
+        Print_patcher("region bypass A-1: adrp+add ref not found, skipping\n");
         return 0;
     }
-    Print_patcher("region bypass: adrp+add ref @ 0x%X\n", adrl_off);
+    Print_patcher("region bypass A-1: adrp+add ref @ 0x%X\n", adrl_off);
 
     /* The gating branch sits exactly one instruction before the adrp. */
     INT32 cbz_off = adrl_off - 4;
     if (cbz_off < 0 || cbz_off + 4 > size) {
-        Print_patcher("region bypass: pre-anchor offset out of range\n");
+        Print_patcher("region bypass A-1: pre-anchor offset out of range\n");
         return 0;
     }
     UINT32 v = *(UINT32*)(buffer + cbz_off);
@@ -753,7 +805,7 @@ INT32 patch_region_lockout_bypass(CHAR8* buffer, INT32 size) {
     /* Accept either CBZ Xt (0xb4) or CBZ Wt (0x34). */
     UINT8 hi = (UINT8)((v >> 24) & 0xff);
     if (hi != 0xb4 && hi != 0x34) {
-        Print_patcher("region bypass: pre-anchor instr is 0x%08X (hi=0x%02x),"
+        Print_patcher("region bypass A-1: pre-anchor instr is 0x%08X (hi=0x%02x),"
                       " expected CBZ; skipping\n", v, hi);
         return 0;
     }
@@ -764,22 +816,22 @@ INT32 patch_region_lockout_bypass(CHAR8* buffer, INT32 size) {
     INT32 target = cbz_off + imm19 * 4;
 
     if (target < 0 || target >= size) {
-        Print_patcher("region bypass: cbz target 0x%X out of range\n", target);
+        Print_patcher("region bypass A-1: cbz target 0x%X out of range\n", target);
         return 0;
     }
-    Print_patcher("region bypass: cbz @ 0x%X -> compatible target 0x%X\n",
+    Print_patcher("region bypass A-1: cbz @ 0x%X -> compatible target 0x%X\n",
                   cbz_off, target);
 
-    /* Stage A: rewrite cbz as unconditional B to the compatible target.
+    /* Rewrite cbz as unconditional B to the compatible target.
      * imm26 is signed, scaled by 4, range +/- 128 MB which always
      * covers a same-function branch. */
     INT32 imm26 = (target - cbz_off) >> 2;
     UINT32 new_v = 0x14000000U | ((UINT32)imm26 & 0x3ffffffU);
 
-    Print_patcher("region bypass: patching 0x%08X -> 0x%08X\n", v, new_v);
+    Print_patcher("region bypass A-1: patching 0x%08X -> 0x%08X\n", v, new_v);
     *(UINT32*)(buffer + cbz_off) = new_v;
 
-    /* Stage B: find the secondary shutdown stub and redirect it to the
+    /* Find the secondary shutdown stub and redirect it to the
      * compatible target. Scan a short window past the primary site for
      * B.cond / CBZ Xt / CBNZ Xt / CBZ Wt / CBNZ Wt whose target differs
      * from the compatible target -- those land on the shutdown stub. */
@@ -808,8 +860,8 @@ INT32 patch_region_lockout_bypass(CHAR8* buffer, INT32 size) {
         break;
     }
     if (shutdown_tgt < 0) {
-        Print_patcher("region bypass: secondary shutdown stub not seen,"
-                      " stage A only\n");
+        Print_patcher("region bypass A-1: secondary shutdown stub not seen,"
+                      " primary only\n");
         return 1;
     }
 
@@ -817,13 +869,13 @@ INT32 patch_region_lockout_bypass(CHAR8* buffer, INT32 size) {
      * reach of an unconditional B from itself. */
     INT32 redirect_imm26 = (target - shutdown_tgt) >> 2;
     if (redirect_imm26 < -0x2000000 || redirect_imm26 >= 0x2000000) {
-        Print_patcher("region bypass: stub 0x%X out of B range to 0x%X\n",
+        Print_patcher("region bypass A-1: stub 0x%X out of B range to 0x%X\n",
                       shutdown_tgt, target);
         return 1;
     }
 
     UINT32 stub_new = 0x14000000U | ((UINT32)redirect_imm26 & 0x3ffffffU);
-    Print_patcher("region bypass: stub @ 0x%X 0x%08X -> 0x%08X (B 0x%X)\n",
+    Print_patcher("region bypass A-1: stub @ 0x%X 0x%08X -> 0x%08X (B 0x%X)\n",
                   shutdown_tgt, read_instr(buffer, shutdown_tgt),
                   stub_new, target);
     write_instr(buffer, shutdown_tgt, stub_new);
@@ -831,12 +883,12 @@ INT32 patch_region_lockout_bypass(CHAR8* buffer, INT32 size) {
     return 2;
 }
 
-/* Stage C — message-page universal bypass.
+/* Stage A-2 — record-table/message-page region bypass.
  *
  * Newer vintages move the diagnostic strings into a structured message
- * table indexed by record id. The cbz X0 anchor used by Stage A no
+ * table indexed by record id. The cbz X0 anchor used by Stage A-1 no
  * longer has a direct adrp+add xref (string-payload lookup is
- * indirected through the table), so Stage A/B silently no-op. The
+ * indirected through the table), so Stage A-1 silently no-ops. The
  * shutdown stub still exists and still ends with `BL <reset>; B
  * <continue>` after one or more `BL <print>` calls preceded by
  * adrp+add references to the message page.
@@ -857,7 +909,7 @@ INT32 patch_region_lockout_bypass(CHAR8* buffer, INT32 size) {
  * 4-byte runtime patch (single NOP). No-op on images without the
  * message text.
  */
-INT32 patch_region_bypass_stage_c(CHAR8* buffer, INT32 size) {
+INT32 patch_region_bypass_stage_a2(CHAR8* buffer, INT32 size) {
     static const CHAR8 needle[] = "incompatible with hardware";
     INT32 needle_len = (INT32)(sizeof(needle) - 1);
 
@@ -869,11 +921,11 @@ INT32 patch_region_bypass_stage_c(CHAR8* buffer, INT32 size) {
         }
     }
     if (msg_off < 0) {
-        Print_patcher("region bypass C: message text not present, skipping\n");
+        Print_patcher("region bypass A-2: message text not present, skipping\n");
         return 0;
     }
     INT32 msg_page = msg_off & ~0xfff;
-    Print_patcher("region bypass C: msg @ 0x%X (page 0x%X)\n", msg_off, msg_page);
+    Print_patcher("region bypass A-2: msg @ 0x%X (page 0x%X)\n", msg_off, msg_page);
 
     for (INT32 i = 0x1000; i + 4 <= size; i += 4) {
         UINT32 inst = read_instr(buffer, i);
@@ -923,7 +975,7 @@ INT32 patch_region_bypass_stage_c(CHAR8* buffer, INT32 size) {
              * print cascade before the reset call. */
             if (adrp_to_page < 2 || bl_count < 3) continue;
 
-            Print_patcher("region bypass C: NOP BL @ 0x%X (was 0x%08X), "
+            Print_patcher("region bypass A-2: NOP BL @ 0x%X (was 0x%08X), "
                           "post-BL B -> 0x%X\n",
                           nx, read_instr(buffer, nx), b_target);
             write_instr(buffer, nx, NOP);
@@ -931,11 +983,13 @@ INT32 patch_region_bypass_stage_c(CHAR8* buffer, INT32 size) {
         }
     }
 
-    Print_patcher("region bypass C: shutdown BL+B pattern not located\n");
+    Print_patcher("region bypass A-2: shutdown BL+B pattern not located\n");
     return 0;
 }
 
-/* Stage D — kernel cmdline `androidboot.pcbaidinfo=` value override.
+/* Stage B — kernel cmdline region override.
+ *
+ * Stage B-1 redirects the `androidboot.pcbaidinfo=` value pointer.
  *
  * ABL builds the kernel cmdline by appending `androidboot.pcbaidinfo=<value>`
  * where the value is sourced at runtime (TZ region tag or device buffer).
@@ -965,7 +1019,7 @@ INT32 patch_pcbaidinfo_override(CHAR8* buffer, INT32 size,
     INT32 key_len = (INT32)(sizeof(key) - 1);
 
     if (region == 0 || region[0] == 0 || region[1] == 0 || region[2] == 0) {
-        Print_patcher("pcbaidinfo: invalid region argument, skipping\n");
+        Print_patcher("cmdline override B-1: invalid region argument, skipping\n");
         return 0;
     }
 
@@ -977,10 +1031,11 @@ INT32 patch_pcbaidinfo_override(CHAR8* buffer, INT32 size,
         }
     }
     if (key_off < 0) {
-        Print_patcher("pcbaidinfo: key string not present, skipping\n");
+        Print_patcher("cmdline override B-1: key string not present, skipping\n");
         return 0;
     }
-    Print_patcher("pcbaidinfo: key @ 0x%X (forcing %s)\n", key_off, region);
+    Print_patcher("cmdline override B-1: key @ 0x%X (forcing %s)\n",
+                  key_off, region);
 
     /* Locate region literal: \0<region>\0 */
     INT32 lit_off = -1;
@@ -994,10 +1049,10 @@ INT32 patch_pcbaidinfo_override(CHAR8* buffer, INT32 size,
         }
     }
     if (lit_off < 0) {
-        Print_patcher("pcbaidinfo: region literal not present, skipping\n");
+        Print_patcher("cmdline override B-1: region literal not present, skipping\n");
         return 0;
     }
-    Print_patcher("pcbaidinfo: region literal @ 0x%X\n", lit_off);
+    Print_patcher("cmdline override B-1: region literal @ 0x%X\n", lit_off);
 
     /* Walk .text for ADRP+ADD pair targeting the key string. */
     INT32 patched = 0;
@@ -1007,7 +1062,7 @@ INT32 patch_pcbaidinfo_override(CHAR8* buffer, INT32 size,
         DecodedInst d1 = decode_at(buffer, i + 4);
         if (d1.type != INST_ADD_X_IMM) continue;
         if (d1.rt != d0.rt || d1.rn != d0.rt) continue;
-        INT64 t = calc_adrl_file_offset(buffer, i, 0);
+        INT64 t = calc_adrl_file_offset(buffer, size, i, 0);
         if (t != (INT64)key_off) continue;
 
         /* Scan next 0x20 bytes for ADD X2, X_any, #imm (sf=1, Rd=2). */
@@ -1023,7 +1078,7 @@ INT32 patch_pcbaidinfo_override(CHAR8* buffer, INT32 size,
         /* Encode ADR X2, lit_off. ADR range is +/- 1MB. */
         INT32 off = lit_off - sink_off;
         if (off < -(1 << 20) || off >= (1 << 20)) {
-            Print_patcher("pcbaidinfo: ADR range exceeded, skipping site\n");
+            Print_patcher("cmdline override B-1: ADR range exceeded, skipping site\n");
             continue;
         }
         UINT32 imm21 = (UINT32)off & 0x1FFFFFu;
@@ -1035,7 +1090,7 @@ INT32 patch_pcbaidinfo_override(CHAR8* buffer, INT32 size,
                    | (immhi << 5)
                    | 2u;
 
-        Print_patcher("pcbaidinfo: ADR X2 @ 0x%X 0x%08X -> 0x%08X "
+        Print_patcher("cmdline override B-1: ADR X2 @ 0x%X 0x%08X -> 0x%08X "
                       "(literal 0x%X)\n",
                       sink_off, read_instr(buffer, sink_off), adr, lit_off);
         write_instr(buffer, sink_off, adr);
@@ -1044,11 +1099,11 @@ INT32 patch_pcbaidinfo_override(CHAR8* buffer, INT32 size,
     }
 
     if (patched == 0)
-        Print_patcher("pcbaidinfo: emission site not located (newer record-table style?)\n");
+        Print_patcher("cmdline override B-1: emission site not located\n");
     return patched;
 }
 
-/* Stage E — `hqsysfs.pcba_config=` kernel cmdline value override.
+/* Stage B-2 — `hqsysfs.pcba_config=` value override.
  *
  * The hqsysfs kernel module exposes /sys/module/hqsysfs/parameters/
  * pcba_config which carries the region tag (PRC vs ROW) from the
@@ -1093,7 +1148,7 @@ INT32 patch_hqsysfs_pcba_config_override(CHAR8* buffer, INT32 size,
     INT32 key_len = (INT32)(sizeof(key) - 1);
 
     if (region == 0 || region[0] == 0 || region[1] == 0 || region[2] == 0) {
-        Print_patcher("hqsysfs override: invalid region argument, skipping\n");
+        Print_patcher("cmdline override B-2: invalid region argument, skipping\n");
         return 0;
     }
 
@@ -1105,10 +1160,11 @@ INT32 patch_hqsysfs_pcba_config_override(CHAR8* buffer, INT32 size,
         }
     }
     if (key_off < 0) {
-        Print_patcher("hqsysfs override: key string absent, skipping\n");
+        Print_patcher("cmdline override B-2: key string absent, skipping\n");
         return 0;
     }
-    Print_patcher("hqsysfs override: key @ 0x%X (forcing %s)\n", key_off, region);
+    Print_patcher("cmdline override B-2: key @ 0x%X (forcing %s)\n",
+                  key_off, region);
 
     INT32 lit_off = -1;
     for (INT32 i = 0; i + 4 < size; ++i) {
@@ -1121,10 +1177,10 @@ INT32 patch_hqsysfs_pcba_config_override(CHAR8* buffer, INT32 size,
         }
     }
     if (lit_off < 0) {
-        Print_patcher("hqsysfs override: region literal not present, skipping\n");
+        Print_patcher("cmdline override B-2: region literal not present, skipping\n");
         return 0;
     }
-    Print_patcher("hqsysfs override: region literal @ 0x%X\n", lit_off);
+    Print_patcher("cmdline override B-2: region literal @ 0x%X\n", lit_off);
 
     /* Find the adrp+add pair targeting key_off, then locate the runtime
      * value load between the key-emit BL and value-emit BL. */
@@ -1135,7 +1191,7 @@ INT32 patch_hqsysfs_pcba_config_override(CHAR8* buffer, INT32 size,
         DecodedInst d1 = decode_at(buffer, i + 4);
         if (d1.type != INST_ADD_X_IMM) continue;
         if (d1.rt != d0.rt || d1.rn != d0.rt) continue;
-        INT64 t = calc_adrl_file_offset(buffer, i, 0);
+        INT64 t = calc_adrl_file_offset(buffer, size, i, 0);
         if (t != (INT64)key_off) continue;
 
         INT32 bl1 = -1, bl2 = -1, value_load = -1;
@@ -1163,7 +1219,7 @@ INT32 patch_hqsysfs_pcba_config_override(CHAR8* buffer, INT32 size,
         /* Encode ADR X2, lit_off. ADR range is +/- 1MB. */
         INT32 off = lit_off - value_load;
         if (off < -(1 << 20) || off >= (1 << 20)) {
-            Print_patcher("hqsysfs override: ADR range exceeded, skipping site\n");
+            Print_patcher("cmdline override B-2: ADR range exceeded, skipping site\n");
             continue;
         }
         UINT32 imm21 = (UINT32)off & 0x1FFFFFu;
@@ -1175,7 +1231,7 @@ INT32 patch_hqsysfs_pcba_config_override(CHAR8* buffer, INT32 size,
                    | (immhi << 5)
                    | 2u;
 
-        Print_patcher("hqsysfs override: ADR X2 @ 0x%X 0x%08X -> 0x%08X "
+        Print_patcher("cmdline override B-2: ADR X2 @ 0x%X 0x%08X -> 0x%08X "
                       "(literal 0x%X), key BL @ 0x%X, value BL @ 0x%X\n",
                       value_load, read_instr(buffer, value_load), adr,
                       lit_off, bl1, bl2);
@@ -1185,11 +1241,11 @@ INT32 patch_hqsysfs_pcba_config_override(CHAR8* buffer, INT32 size,
     }
 
     if (patched == 0)
-        Print_patcher("hqsysfs override: ADRL/value-load pair not found (newer record-table style?)\n");
+        Print_patcher("cmdline override B-2: ADRL/value-load pair not found\n");
     return patched;
 }
 
-/* Stage F — vbmeta AVB key swap.
+/* Stage C — vbmeta AVB key swap.
  *
  * Locates the embedded 4096-bit AvbRSAPublicKey blob for the platform's
  * stock vbmeta verify key and overwrites it in place with the AOSP test
@@ -1327,7 +1383,7 @@ static const UINT8 AOSP_AVB_BLOB[1032] = {
 
 INT32 patch_swap_avb_key_arb(CHAR8* buffer, INT32 size) {
     if (size < AVB_BLOB_LEN) {
-        Print_patcher("avb_key_arb: buffer too small, skipping\n");
+        Print_patcher("avb key swap C: buffer too small, skipping\n");
         return 0;
     }
     INT32 patched = 0;
@@ -1335,16 +1391,16 @@ INT32 patch_swap_avb_key_arb(CHAR8* buffer, INT32 size) {
     for (INT32 i = 0; i <= limit; ++i) {
         if (memcmp_patcher(buffer + i, STOCK_AVB_ANCHOR, AVB_ANCHOR_LEN) != 0)
             continue;
-        Print_patcher("avb_key_arb: stock AvbRSAPublicKey @ 0x%X, overwriting"
+        Print_patcher("avb key swap C: stock AvbRSAPublicKey @ 0x%X, overwriting"
                       " with AOSP testkey (%d bytes)\n", i, AVB_BLOB_LEN);
         memcpy_patcher(buffer + i, AOSP_AVB_BLOB, AVB_BLOB_LEN);
         patched++;
         i += AVB_BLOB_LEN - 1;
     }
     if (patched == 0)
-        Print_patcher("avb_key_arb: stock key not located, skipping\n");
+        Print_patcher("avb key swap C: stock key not located, skipping\n");
     else if (patched > 1)
-        Print_patcher("avb_key_arb: warning, %d sites swapped (expected 1)\n",
+        Print_patcher("avb key swap C: warning, %d sites swapped (expected 1)\n",
                       patched);
     return patched;
 }
@@ -1408,26 +1464,26 @@ BOOLEAN PatchBuffer(CHAR8* data, INT32 size) {
 
     #ifndef DISABLE_PATCH_REGION
     if (patch_region_lockout_bypass(data, size) == 0)
-        Print_patcher("Info: region lockout bypass (A/B) not applied\n");
-    if (patch_region_bypass_stage_c(data, size) == 0)
-        Print_patcher("Info: region lockout bypass (C) not applied\n");
+        Print_patcher("Info: region lockout bypass (A-1) not applied\n");
+    if (patch_region_bypass_stage_a2(data, size) == 0)
+        Print_patcher("Info: region lockout bypass (A-2) not applied\n");
     #endif
 
     #if defined(FORCE_PCBAIDINFO_PRC)
     if (patch_pcbaidinfo_override(data, size, "PRC") == 0)
-        Print_patcher("Info: pcbaidinfo override (PRC) not applied\n");
+        Print_patcher("Info: cmdline override (B-1/PRC) not applied\n");
     if (patch_hqsysfs_pcba_config_override(data, size, "PRC") == 0)
-        Print_patcher("Info: hqsysfs.pcba_config override (PRC) not applied\n");
+        Print_patcher("Info: cmdline override (B-2/PRC) not applied\n");
     #elif defined(FORCE_PCBAIDINFO_ROW)
     if (patch_pcbaidinfo_override(data, size, "ROW") == 0)
-        Print_patcher("Info: pcbaidinfo override (ROW) not applied\n");
+        Print_patcher("Info: cmdline override (B-1/ROW) not applied\n");
     if (patch_hqsysfs_pcba_config_override(data, size, "ROW") == 0)
-        Print_patcher("Info: hqsysfs.pcba_config override (ROW) not applied\n");
+        Print_patcher("Info: cmdline override (B-2/ROW) not applied\n");
     #endif
 
     #if defined(FORCE_AVB_KEY_ARB)
     if (patch_swap_avb_key_arb(data, size) == 0)
-        Print_patcher("Info: AVB key swap not applied\n");
+        Print_patcher("Info: AVB key swap (C) not applied\n");
     #endif
 
     return 1;
