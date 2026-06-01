@@ -362,6 +362,58 @@ INT32 source_callback(CHAR8* buffer, INT32 size, INT32 now_offset, INT8 current_
 INT32 empty_callback(CHAR8* buffer, INT32 size, INT32 now_offset, INT8 current_target, INT32 anchor_offset) {
     return 0;
 }
+
+#define KEYMASTER_UNLOCK_SINK_MAX_BYTES 0x400
+#define KEYMASTER_UNLOCK_STACK_OFF      0x60
+#define KEYMASTER_COLOR_STACK_OFF       0x64
+
+static BOOLEAN is_stp_w_sp_imm(UINT32 raw, UINT32 imm) {
+    if ((raw & 0xFFC00000u) != 0x29000000u) return FALSE;
+    if (((raw >> 5) & 0x1Fu) != 31) return FALSE;
+
+    INT32 imm7 = (INT32)((raw >> 15) & 0x7F);
+    if (imm7 & 0x40) imm7 |= ~0x7F;
+    return (UINT32)(imm7 << 2) == imm;
+}
+
+static BOOLEAN has_keymaster_unlock_context(CHAR8* buffer, INT32 size, INT32 off) {
+    INT32 end = off + 0x40;
+    if (end > size - 4) end = size - 4;
+
+    for (INT32 i = off + 4; i <= end; i += 4) {
+        if (is_stp_w_sp_imm(read_instr(buffer, i), KEYMASTER_COLOR_STACK_OFF))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+INT32 patch_keymaster_unlock_sink(CHAR8* buffer, INT32 size, INT32 anchor_off) {
+    if (anchor_off < 0 || anchor_off >= size - 4) return 0;
+
+    INT32 patched = 0;
+    INT32 end = anchor_off + KEYMASTER_UNLOCK_SINK_MAX_BYTES;
+    if (end > size - 4) end = size - 4;
+
+    for (INT32 off = anchor_off + 4; off <= end; off += 4) {
+        DecodedInst d = decode_at(buffer, off);
+        if (d.type != INST_STRB_IMM) continue;
+        if (d.rn != 31 || d.imm != KEYMASTER_UNLOCK_STACK_OFF) continue;
+        if (!has_keymaster_unlock_context(buffer, size, off)) continue;
+
+        Print_patcher("KeyMaster unlock sink @ 0x%X: STRB W%d,[SP,#0x%X]\n",
+                      off, d.rt, d.imm);
+        Print_patcher("  Before: %02X %02X %02X %02X\n",
+                      (UINT8)buffer[off], (UINT8)buffer[off+1],
+                      (UINT8)buffer[off+2], (UINT8)buffer[off+3]);
+        write_instr(buffer, off, strb_with_reg(d.raw, 31));
+        Print_patcher("  After : %02X %02X %02X %02X (Rt -> WZR)\n",
+                      (UINT8)buffer[off], (UINT8)buffer[off+1],
+                      (UINT8)buffer[off+2], (UINT8)buffer[off+3]);
+        patched++;
+    }
+    return patched;
+}
+
 //定义 callback 函数类型
 typedef INT32 (*SourceCallback)(CHAR8* buffer, INT32 size, INT32 now_offset, INT8 current_target, INT32 anchor_offset);
 /* ============================================================
@@ -928,7 +980,7 @@ INT32 patch_pcbaidinfo_override(CHAR8* buffer, INT32 size,
         Print_patcher("pcbaidinfo: key string not present, skipping\n");
         return 0;
     }
-    Print_patcher("pcbaidinfo: key @ 0x%X (forcing %a)\n", key_off, region);
+    Print_patcher("pcbaidinfo: key @ 0x%X (forcing %s)\n", key_off, region);
 
     /* Locate region literal: \0<region>\0 */
     INT32 lit_off = -1;
@@ -1056,7 +1108,7 @@ INT32 patch_hqsysfs_pcba_config_override(CHAR8* buffer, INT32 size,
         Print_patcher("hqsysfs override: key string absent, skipping\n");
         return 0;
     }
-    Print_patcher("hqsysfs override: key @ 0x%X (forcing %a)\n", key_off, region);
+    Print_patcher("hqsysfs override: key @ 0x%X (forcing %s)\n", key_off, region);
 
     INT32 lit_off = -1;
     for (INT32 i = 0; i + 4 < size; ++i) {
@@ -1337,6 +1389,17 @@ BOOLEAN PatchBuffer(CHAR8* data, INT32 size) {
                (int)lock_register_num);
     }
     Print_patcher("Global variable offset (for warning patch): 0x%X\n", global_var_offset);
+
+    #ifndef DISABLE_PATCH_7
+    INT32 km_unlock_patches = patch_keymaster_unlock_sink(data, size, offset);
+    if (km_unlock_patches == 0) {
+        Print_patcher("Warning: KeyMaster unlock sink not found\n");
+    } else if (km_unlock_patches > 1) {
+        Print_patcher("Warning: Multiple KeyMaster unlock sinks patched (%d)\n", km_unlock_patches);
+        return FALSE;
+    }
+    #endif
+
     // ===================== 启用去黄字补丁 =====================
     if (!patch_warning(data, size, global_var_offset)) {
         Print_patcher("Warning: patch_warning failed\n");
