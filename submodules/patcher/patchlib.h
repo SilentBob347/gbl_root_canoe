@@ -1405,6 +1405,66 @@ INT32 patch_swap_avb_key_arb(CHAR8* buffer, INT32 size) {
     return patched;
 }
 
+/* Stage D — disable `oem lock-flash` fastboot command.
+ *
+ * On ROW builds an `oem lock-flash` command writes the CSDK flash_dis
+ * flag to 1, which gates Firehose LUN 0 writes on next EDL session. The
+ * state is sticky across normal reboots — once set, EDL flashes that touch
+ * protected LUNs begin to NAK partway through, leaving the device
+ * in a half-flashed state with no in-band recovery path.
+ *
+ * Defensive measure: scan the patch buffer for the literal cmd string
+ * `oem lock-flash` and overwrite the byte at offset 4 (the `l` in
+ * `lock`) with an underscore. The stored cmd-table entry becomes
+ * `oem _ock-flash` — same length, still NUL-terminated, but no longer
+ * a prefix or whole-string match for any user input. The EDK2 fastboot
+ * dispatcher does prefix matching (see `fastboot flashing unlock` ->
+ * `oem unlock`), so an all-NUL truncation to `oem ` would actually
+ * widen the match instead of narrowing it; the underscore preserves
+ * the original string length and avoids creating a broad `oem ` prefix
+ * that could be hit by any future `oem X` user input.
+ *
+ * Boundary check: require the match to be standalone (NUL-preceded
+ * and NUL-followed) so we do not corrupt a longer string that happens
+ * to contain the same substring. Single-byte runtime patch per hit.
+ * PRC builds lack the cmd string entirely; locator silently no-ops.
+ */
+INT32 patch_disable_lock_flash_cmd(CHAR8* buffer, INT32 size) {
+    static const CHAR8 needle[] = "oem lock-flash";
+    INT32 needle_len = (INT32)(sizeof(needle) - 1);
+    INT32 patched = 0;
+
+    if (size < needle_len + 1) return 0;
+
+    for (INT32 i = 0; i + needle_len < size; ++i) {
+        if (memcmp_patcher(buffer + i, needle, needle_len) != 0) continue;
+        if (buffer[i + needle_len] != 0) continue;
+        if (i > 0 && buffer[i - 1] != 0) continue;
+
+        Print_patcher("disable_lock_flash: hit @ 0x%X, mangling cmd "
+                      "string at offset +4\n", i);
+        Print_patcher("  Before: %02X %02X %02X %02X %02X %02X %02X\n",
+                      (UINT8)buffer[i], (UINT8)buffer[i+1], (UINT8)buffer[i+2],
+                      (UINT8)buffer[i+3], (UINT8)buffer[i+4], (UINT8)buffer[i+5],
+                      (UINT8)buffer[i+6]);
+        buffer[i + 4] = '_';
+        Print_patcher("  After : %02X %02X %02X %02X %02X %02X %02X\n",
+                      (UINT8)buffer[i], (UINT8)buffer[i+1], (UINT8)buffer[i+2],
+                      (UINT8)buffer[i+3], (UINT8)buffer[i+4], (UINT8)buffer[i+5],
+                      (UINT8)buffer[i+6]);
+
+        patched++;
+        i += needle_len - 1;
+    }
+
+    if (patched == 0)
+        Print_patcher("disable_lock_flash: string not present, skipping\n");
+    else if (patched > 1)
+        Print_patcher("disable_lock_flash: warning, %d sites patched "
+                      "(expected 1)\n", patched);
+    return patched;
+}
+
 BOOLEAN PatchBuffer(CHAR8* data, INT32 size) {
     #ifndef DISABLE_PATCH_1
     if (patch_abl_gbl(data, size) != 0)
@@ -1484,6 +1544,11 @@ BOOLEAN PatchBuffer(CHAR8* data, INT32 size) {
     #if defined(FORCE_AVB_KEY_ARB)
     if (patch_swap_avb_key_arb(data, size) == 0)
         Print_patcher("Info: AVB key swap (C) not applied\n");
+    #endif
+
+    #ifndef DISABLE_PATCH_LOCK_FLASH_CMD
+    if (patch_disable_lock_flash_cmd(data, size) == 0)
+        Print_patcher("Info: disable lock-flash cmd (D) not applied\n");
     #endif
 
     return 1;
